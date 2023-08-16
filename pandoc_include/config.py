@@ -5,6 +5,10 @@ import json
 from .utils import eprint
 
 CONFIG_KEYS = {
+    "prefix": str,
+    "suffix": str,
+    "multiContentDelimiters": str,
+    "contentStrip": str,
     "startLine": int,
     "endLine": int,
     "snippetStart": str,
