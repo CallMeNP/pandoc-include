@@ -9,7 +9,6 @@ import glob
 import re
 from natsort import natsorted
 from urllib.parse import urlparse
-from collections import OrderedDict
 from .format_heuristics import formatFromPath
 from .config import parseConfig, parseOptions, TEMP_FILE
 from .utils import eprint
@@ -19,14 +18,12 @@ def is_include_line(elem):
     # value: return 0 for false, 1 for include file, 2 for include header
     value = 0
     config = {}
-    name = None
+    names = []
     if not hasattr(elem, "_content"):
         value = 0
-    elif (len(elem.content) not in [3, 4]) \
-        or (not isinstance(elem.content[0], pf.Str)) \
-        or (elem.content[0].text not in ['!include', '$include', '!include-header', '$include-header']) \
-        or (not isinstance(elem.content[-2], pf.Space)) \
-        or (len(elem.content) == 4 and not isinstance(elem.content[1], pf.Code)):
+    elif (not isinstance(elem.content[0], pf.Str)) \
+            or (elem.content[0].text not in ['!include', '$include', '!include-header', '$include-header']) \
+            or (not isinstance(elem.content[-2], pf.Space)):
         value = 0
     else:
         if elem.content[0].text in ['!include', '$include']:
@@ -36,19 +33,21 @@ def is_include_line(elem):
             # include header
             value = 2
 
-        # filename
-        fn = elem.content[-1]
-        if isinstance(fn, pf.Quoted):
-            # Convert list to args of Para
-            name = pf.stringify(pf.Para(*fn.content), newlines=False)
-        else:
-            name = fn.text
-        
+        # filenames
+        for i in elem.content[2:]:
+            if isinstance(i, pf.Quoted):
+                names.append(pf.stringify(pf.Para(*i.content), newlines=False))
+            elif isinstance(i, pf.Space):
+                continue
+            elif isinstance(i, pf.Str):
+                names.append(i.text)
+            else:
+                raise ValueError('Invalid include parameter: ' + pf.stringify(i, newlines=False))
         # config
-        if len(elem.content) == 4:
+        if isinstance(elem.content[1], pf.Code):
             config = parseConfig(elem.content[1].text)
-        
-    return value, name, config
+
+    return value, names, config
 
 
 def is_code_include(elem):
@@ -56,11 +55,11 @@ def is_code_include(elem):
         new_elem = pf.convert_text(elem.text)[0]
     except:
         return 0, None, None
-    value, name, config = is_include_line(new_elem)
+    value, names, config = is_include_line(new_elem)
     if value == 2:
         eprint("[Warn] Invalid !include-header in code blocks")
         value = 0
-    return value, name, config
+    return value, names, config
 
 
 # Skip whitespaces until newline
@@ -74,6 +73,7 @@ def skipWhitespaces(content):
         pos += 1
     return pos
 
+
 def removeLeadingWhitespaces(s, num):
     regex = re.compile(r"[^\s]")
     m = regex.search(s)
@@ -85,6 +85,7 @@ def removeLeadingWhitespaces(s, num):
     else:
         return s[min(pos, num):]
 
+
 def dedent(content: str, num):
     lines = content.split("\n")
     return list(map(lambda s: removeLeadingWhitespaces(s, num), lines))
@@ -93,7 +94,7 @@ def dedent(content: str, num):
 def read_file(filename, config: dict):
     with open(filename, encoding="utf-8") as f:
         content = f.read()
-    
+
     if "startLine" in config or "endLine" in config:
         lines = content.split("\n")
         startLine = config.get("startLine", 1) - 1
@@ -105,7 +106,7 @@ def read_file(filename, config: dict):
             endLine += len(lines) + 1
         result = lines[startLine:endLine]
         content = "\n".join(result)
-       
+
     if "snippetStart" in config or "snippetEnd" in config:
         start = 0
         length = len(content)
@@ -155,7 +156,7 @@ def read_file(filename, config: dict):
             snippets.append(content[start:subEnd])
             start = end
         content = "\n".join(snippets)
-    
+
     if "dedent" in config:
         content = "\n".join(dedent(content, config["dedent"]))
 
@@ -183,15 +184,18 @@ def action(elem, doc):
         entryEnter = True
 
     if isinstance(elem, pf.Para):
-        includeType, name, config = is_include_line(elem)
+        includeType, names, config = is_include_line(elem)
 
         if includeType == 0:
             return
 
         # Enable shell-style wildcards
-        files = glob.glob(name)
+        files = []
+        for i in names:
+            files += glob.glob(i)
+
         if len(files) == 0:
-            eprint('[Warn] included file not found: ' + name)
+            eprint('[Warn] included file not found: ' + " ".join(names))
 
         # order
         include_order = options['include-order']
@@ -205,111 +209,130 @@ def action(elem, doc):
             raise ValueError('Invalid file order: ' + include_order)
 
         elements = []
-        for fn in files:
+        raw = ""
+        for i, fn in enumerate(files):
             if not os.path.isfile(fn):
                 continue
 
-            raw = read_file(fn, config)
-
-            # Save current path
-            cur_path = os.getcwd()
-
-            # Change to included file's path so that sub-include's path is correct
-            target = os.path.dirname(fn)
-            # Empty means relative to current dir
-            if not target:
-                target = '.'
-
-            currentPath = options["current-path"]
-            options["current-path"] = os.path.normpath(os.path.join(currentPath, target))
-            os.chdir(target)
-
-            # pass options by temp files
-            with open(TEMP_FILE, 'w+') as f:
-                json.dump(options, f)
-
-            # Add recursive include support
-            new_elems = None
-            new_metadata = None
-            if includeType == 1:
-                # Set file format
-                if "format" in config:
-                    fmt = config["format"]
-                else:
-                    fmt = formatFromPath(fn)
-                # default use markdown
-                if fmt is None:
-                    fmt = "markdown"
-
-                # copy since pf will modify this argument
-                pandoc_options = list(options["pandoc-options"])
-
-                if "raw" in config:
-                    rawFmt = config.get("raw")
-                    # raw block
-                    new_elems = [pf.RawBlock(raw, format=rawFmt)]
-                else:
-                    new_elems = pf.convert_text(
-                        raw,
-                        input_format=fmt,
-                        extra_args=pandoc_options
-                    )
-
-                    # Get metadata (Recursive header include)
-                    new_metadata = pf.convert_text(
-                        raw,
-                        input_format=fmt,
-                        standalone=True,
-                        extra_args=pandoc_options
-                    ).get_metadata(builtin=False)
-
+            raw_ = read_file(fn, config)
+            match config.get('contentStrip', ""):
+                case "both":
+                    raw_ = raw_.strip()
+                case "left":
+                    raw_ = raw_.lstrip()
+                case "right":
+                    raw_ = raw_.rstrip()
+            if i == 0:
+                raw_ = config.get('prefix', "") + raw_
             else:
-                # Read header from yaml
-                # Use pf to preserve all info
-                new_metadata = pf.convert_text(f"---\n{raw}\n---", standalone=True).get_metadata(builtin=False)
+                raw_ = config.get('multiContentDelimiter', "\n") + raw_
+            if i == len(files) - 1:
+                raw_ = raw_ + config.get('suffix', "")
+            raw += raw_
 
-            # Merge metadata
-            if new_metadata is not None:
-                for key in new_metadata.content:
-                    if not key in doc.metadata.content:
-                        doc.metadata[key] = new_metadata[key]
+        # Save current path
+        cur_path = os.getcwd()
 
-            # delete temp file (the file might have been deleted in subsequent executions)
-            if os.path.exists(TEMP_FILE):
-                os.remove(TEMP_FILE)
-            # Restore to current path
-            os.chdir(cur_path)
-            options["current-path"] = currentPath 
+        # Change to included file's path so that sub-include's path is correct
+        # !!! 切換到第一個文件的路徑。多個文件的情況必須屬於同一路徑。
+        target = os.path.dirname(files[0])
+        # Empty means relative to current dir
+        if not target:
+            target = '.'
 
-            # incremement headings
-            increment = config.get('incrementSection', 0)
+        currentPath = options["current-path"]
+        options["current-path"] = os.path.normpath(os.path.join(currentPath, target))
+        os.chdir(target)
 
-            if increment:
-                for elem in new_elems:
-                    if isinstance(elem, pf.Header):
-                        elem.level += increment
+        # pass options by temp files
+        with open(TEMP_FILE, 'w+') as f:
+            json.dump(options, f)
 
-            if new_elems != None:
-                elements += new_elems
+        # Add recursive include support
+        new_elems = None
+        new_metadata = None
+        if includeType == 1:
+            # Set file format
+            if "format" in config:
+                fmt = config["format"]
+            else:
+                # !!! 限制了所有文件必须为相同的格式。
+                fmt = formatFromPath(files[0])
+            # default use markdown
+            if fmt is None:
+                fmt = "markdown"
+
+            # copy since pf will modify this argument
+            pandoc_options = list(options["pandoc-options"])
+
+            if "raw" in config:
+                rawFmt = config.get("raw")
+                # raw block
+                new_elems = [pf.RawBlock(raw, format=rawFmt)]
+            else:
+                new_elems = pf.convert_text(
+                    raw,
+                    input_format=fmt,
+                    extra_args=pandoc_options
+                )
+
+                # Get metadata (Recursive header include)
+                new_metadata = pf.convert_text(
+                    raw,
+                    input_format=fmt,
+                    standalone=True,
+                    extra_args=pandoc_options
+                ).get_metadata(builtin=False)
+
+        else:
+            # Read header from yaml
+            # Use pf to preserve all info
+            new_metadata = pf.convert_text(f"---\n{raw}\n---", standalone=True).get_metadata(builtin=False)
+
+        # Merge metadata
+        if new_metadata is not None:
+            for key in new_metadata.content:
+                if not key in doc.metadata.content:
+                    doc.metadata[key] = new_metadata[key]
+
+        # delete temp file (the file might have been deleted in subsequent executions)
+        if os.path.exists(TEMP_FILE):
+            os.remove(TEMP_FILE)
+        # Restore to current path
+        os.chdir(cur_path)
+        options["current-path"] = currentPath
+
+        # increment headings
+        increment = config.get('incrementSection', 0)
+
+        if increment:
+            for elem in new_elems:
+                if isinstance(elem, pf.Header):
+                    elem.level += increment
+
+        if new_elems != None:
+            elements += new_elems
 
         return elements
-    
+
     elif isinstance(elem, pf.CodeBlock):
-        includeType, name, config = is_code_include(elem)
+        includeType, names, config = is_code_include(elem)
         if includeType == 0:
             return
-        
+
         # Enable shell-style wildcards
-        files = glob.glob(name)
+        files = []
+        for i in names:
+            files += glob.glob(i)
         if len(files) == 0:
-            eprint('[Warn] included file not found: ' + name)
+            eprint('[Warn] included file not found: ' + names)
 
         codes = []
         for fn in files:
             codes.append(read_file(fn, config))
 
         elem.text = "\n".join(codes)
-    
+
     elif isinstance(elem, pf.Image):
         rewritePath = options.get("rewrite-path", True)
         if not rewritePath:
